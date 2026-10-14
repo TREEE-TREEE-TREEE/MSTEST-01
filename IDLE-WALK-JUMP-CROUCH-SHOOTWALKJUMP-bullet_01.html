@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<title>Metal Slug Test</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center}
+  /* pixelated = ingrandimento "a blocchi" senza sfocature: i pixel restano nitidi */
+  canvas{image-rendering:pixelated;width:min(100vw,calc(100vh*608/448));aspect-ratio:608/448;background:#000}
+</style>
+</head>
+<body>
+<canvas id="game" width="608" height="448"></canvas>
+
+<script>
+/* =====================================================================
+   METAL SLUG TEST
+   Il canvas e' 608x448: 1 pixel dello sprite = 1 pixel del canvas.
+   Gli sprite vengono rimpiccioliti alla dimensione di gioco al caricamento.
+   Le velocita' sono in "pixel per frame a 60fps".
+   ===================================================================== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+const W = canvas.width, H = canvas.height;
+const LEVEL_WIDTH = 4800;          // lunghezza del livello (per lo scorrimento)
+const GROUND_Y = 384;              // altezza del terreno (y dove inizia il suolo)
+
+/* ---------------- PARAMETRI DI GIOCABILITA' (modificali qui) ---------------- */
+const WALK_SPEED    = 3;     // velocita' di camminata
+const JUMP_VELOCITY = -10.8; // spinta iniziale del salto
+const GRAVITY       = 0.56;  // gravita' del player
+const BULLET_SPEED  = 14;    // velocita' proiettile
+const FIRE_COOLDOWN = 7;     // frame tra uno sparo e l'altro (tenendo premuto C)
+const BOMB_COOLDOWN = 20;    // frame tra una bomba e l'altra
+const BOMB_GRAVITY  = 0.44;  // gravita' della bomba
+
+/* ---------------- INPUT (tastiera) ----------------
+   Sinistra/Destra = muovi | Su = mira in alto | Giu = accovacciati
+   Spazio = salto | C = spara | X = bomba */
+const keys = {};
+const pressedThisFrame = {};  // true solo nel frame in cui il tasto viene premuto
+window.addEventListener('keydown', e => {
+  if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+  if (!keys[e.code]) pressedThisFrame[e.code] = true;
+  keys[e.code] = true;
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+/* ---------------- STATO DEL GIOCO ---------------- */
+const player = {
+  x: 80, y: GROUND_Y, vx: 0, vy: 0,   // y = posizione dei PIEDI
+  w: 24, h: 80,                        // hitbox in piedi
+  facing: 1,                           // 1 = destra, -1 = sinistra
+  onGround: true, crouching: false, aimUp: false,
+  fireTimer: 0, bombTimer: 0, walkTimer: 0, airTimer: 0, landTimer: 0, crouchTimer: 0, standTimer: 0,
+  shootAge: 999                        // tick dall'ultimo sparo (999 = animazione di sparo ferma)
+};
+const bullets = [];
+const bombs = [];
+const explosions = [];
+const impacts = [];    // splash dei proiettili che hanno colpito qualcosa
+const muzzles = [];    // lampi di partenza all'ugello
+let cameraX = 0;
+let frameCount = 0;
+
+/* ---------------- SPRITE ----------------
+   Tre sprite sheet su sfondo verde, caricati da GitHub:
+     - IDLE: 4 frame in fila
+     - WALK: 4 frame (la seconda riga dello sheet e' una copia della prima, non serve)
+     - JUMP: 5 frame (carica, salita, apice, discesa, atterraggio)
+     - CROUCH: 3 frame usati (transizione + due frame da accovacciato)
+     - SHOOT: 4 frame (posa iniziale, giacca aperta con ugello, sparo con spruzzo, posa finale)
+     - SHOOTWALK: gli stessi 4 frame di SHOOT, ma mentre cammini
+     - JUMPSHOOT: 5 frame per lo sparo in salto (stacco, giacca aperta, sparo, atterraggio, in piedi: l'ultimo non e' usato)
+     - BULLET: 5 frame del proiettile (lampo di partenza, in volo, 3 frame di impatto)
+   Per ogni frame: tolgo il verde (con recupero dei bordi morbidi), lo ritaglio,
+   lo rimpicciolisco alla dimensione di gioco e lo "ancoro" alla testa e ai piedi,
+   cosi' non trema quando cambia frame. Entrambi gli sheet guardano a DESTRA. */
+const RAW = 'https://raw.githubusercontent.com/TREEE-TREEE-TREEE/MSTEST-01/main/';
+const SPRITE_H = 84;           // altezza del personaggio nel gioco (in pixel del canvas)
+const SPRITE_FACES_RIGHT = true;
+const IDLE_FRAME_TICKS = 12;   // ogni quanti aggiornamenti cambia frame idle (12 = 5 fps)
+const WALK_FRAME_TICKS = 6;    // idem per la camminata (6 = 10 fps)
+const JUMP_TAKEOFF_TICKS = 3;  // per quanti aggiornamenti si vede la posa "carica" a inizio salto
+const JUMP_APEX_VY = 2.5;      // sotto questa velocita' verticale (in valore assoluto) si vede la posa di apice
+const CROUCH_ENTER_TICKS = 4;  // quanto dura la posa di transizione quando premi Giu
+const CROUCH_EXIT_TICKS = 4;   // quanto dura la stessa posa quando rilasci Giu e ti rialzi
+const CROUCH_HOLD_TICKS = 20;  // ogni quanti aggiornamenti si alternano i due frame da accovacciato
+const LAND_TICKS = 6;          // per quanti aggiornamenti si vede la posa di atterraggio (se stai fermo)
+// SHOOT (a terra, fermo o camminando; camminando usa lo sheet SHOOTWALK): a ogni colpo parte la sequenza giacca aperta -> sparo -> giacca aperta -> posa finale.
+// Se tieni premuto C, il colpo successivo riparte dal frame dello sparo (la sequenza si completa quando smetti).
+const SHOOT_WINDUP_TICKS = 2;  // posa "giacca aperta" solo sul primo colpo, prima dello spruzzo
+const SHOOT_FIRE_TICKS = 3;    // per quanti aggiornamenti si vede lo spruzzo
+const SHOOT_OPEN_TICKS = 4;    // per quanti aggiornamenti resta la giacca aperta dopo lo sparo
+const SHOOT_CLOSE_TICKS = 4;   // per quanti aggiornamenti si vede la posa finale (giacca chiusa)
+const SHOOT_END_TICKS = SHOOT_FIRE_TICKS + SHOOT_OPEN_TICKS + SHOOT_CLOSE_TICKS;   // fine della sequenza
+
+// PROIETTILE (sheet BULLET): partenza (lampo all'ugello) -> volo (il getto cresce e avanza) -> impatto (3 frame).
+const BULLET_LAUNCH_TICKS = 3;        // per quanti aggiornamenti si vede il lampo di partenza (resta attaccato al personaggio)
+const BULLET_TRAIL_START = 10;        // lunghezza (px) del getto appena uscito: poi si allunga fino alla lunghezza intera
+const BULLET_IMPACT_FRAME_TICKS = 4;  // durata di ciascuno dei 3 frame di impatto
+// Punto da cui esce il getto, in px rispetto al centro del personaggio (avanti) e ai suoi piedi (in alto).
+// Misurato sulla posizione dell'ugello negli sprite di sparo (SHOOT, SHOOTWALK, JUMPSHOOT).
+const MUZZLE_STAND = [16, 27.5];      // fermo
+const MUZZLE_WALK  = [16, 28.6];      // camminando
+const MUZZLE_AIR   = [16, 36.4];      // in salto
+// Bersagli segnaposto (casse) per vedere l'impatto: i proiettili si fermano e fanno lo splash. Metti false per toglierli.
+const SHOW_TEST_TARGETS = true;
+const targets = SHOW_TEST_TARGETS ? [
+  { x: 420,  y: GROUND_Y - 64,  w: 44, h: 64 },
+  { x: 700,  y: GROUND_Y - 150, w: 44, h: 150 },   // alta: si colpisce anche saltando
+  { x: 1000, y: GROUND_Y - 64,  w: 44, h: 64 },
+  { x: 1400, y: GROUND_Y - 150, w: 44, h: 150 }
+] : [];
+
+// Ogni sheet: nome file, altezza "di riferimento" del personaggio nell'immagine originale
+// (serve per calcolare la scala) e le celle [x0, x1, y0, y1] che contengono i frame.
+const SHEETS = {
+  idle: { file: 'Pixel art sprite sheet in the style of Metal Slug (SNK, Neo Geo arcade, 1996), one horizontal row of.png',
+          refH: 520,
+          cells: [[20,320,0,560],[320,605,0,560],[605,890,0,560],[890,1195,0,560]] },
+  walk: { file: 'Use the attached character as the EXACT reference design (same head, hair, face,_suit, tie, shoes, c.png',
+          refH: 377,
+          cells: [[0,435,0,422],[435,860,0,422],[860,1247,0,422],[1247,1774,0,422]] },
+  // JUMP: 5 frame -> 0 = carica, 1 = salita, 2 = apice, 3 = discesa, 4 = atterraggio.
+  // refH e' calibrato per avere la testa della stessa grandezza di idle e walk.
+  jump: { file: 'JUMP_01.png',
+          refH: 469,
+          cells: [[0,417,0,844],[417,750,0,844],[750,1100,0,844],[1100,1447,0,844],[1447,1864,0,844]] },
+  // CROUCH: 0 = transizione (giu / su), 1 e 2 = accovacciato fermo. Il frame 3 (in piedi) non serve.
+  crouch: { file: 'CROUCH_01.png',
+          refH: 515,
+          cells: [[0,385,0,1086],[385,718,0,1086],[718,1073,0,1086]] },
+  // SHOOT: 0 = posa iniziale, 1 = giacca aperta (si vede l'ugello), 2 = sparo (spruzzo + vampata), 3 = posa finale.
+  // refH e' calibrato per avere la testa della stessa grandezza di idle e walk.
+  // headFrac: quanta parte dell'altezza (dall'alto) usare per trovare il centro della testa. Qui e' piccola
+  // perche' lo spruzzo del frame 2 sale in alto e altrimenti sposterebbe l'ancoraggio.
+  shoot: { file: 'SHOOT_02.png',
+          refH: 502,
+          headFrac: 0.12,
+          cells: [[0,355,0,887],[355,815,0,887],[815,1400,0,887],[1400,1774,0,887]] },
+  // SHOOTWALK: stessi 4 frame di SHOOT ma in camminata (0 = posa iniziale, 1 = giacca aperta, 2 = sparo, 3 = posa finale).
+  shootwalk: { file: 'SHOOTwalking_01.png',
+          refH: 476,
+          headFrac: 0.12,
+          cells: [[0,370,0,887],[370,801,0,887],[801,1397,0,887],[1397,1774,0,887]] },
+  // JUMPSHOOT: 0 = stacco (piedi a terra), 1 = giacca aperta in salita, 2 = sparo a mezz'aria, 3 = atterraggio, 4 = in piedi (non usato).
+  // Nello sheet lo spruzzo del frame 2 passa sopra l'anca del frame 3 (stesse x, y diverse): le celle 2 e 3 si
+  // sovrappongono di qualche pixel e 'erase' cancella, in ognuna, la parte che appartiene all'altro frame.
+  // erase: per ogni frame, lista di rettangoli [x0, x1, y0, y1] (coordinate dello sheet) da rendere trasparenti, oppure null.
+  jumpshoot: { file: 'JUMPSHOOT_01.png',
+          refH: 388,
+          headFrac: 0.12,
+          cells: [[0,332,0,887],[332,721,0,887],[721,1190,0,887],[1161,1424,0,887],[1424,1774,0,887]],
+          erase: [null, null, [[1161,1190,460,700]], [[1161,1190,0,440]], null] },
+  // BULLET: 0 = partenza (lampo all'ugello), 1 = in volo, 2 = impatto: splash che si apre, 3 = splash grande, 4 = goccioline che svaniscono.
+  // refH uguale a quello di SHOOT, cosi' il proiettile ha la stessa scala del personaggio.
+  // points: per ogni frame, il punto dello sheet [x, y] che va appoggiato sulla posizione del proiettile:
+  //   0 = bocca dell'ugello, 1 = punta anteriore del getto, 2-4 = centro dello splash.
+  bullet: { file: 'BULLET_01.png',
+          refH: 502,
+          cells: [[0,300,0,724],[300,916,0,724],[916,1281,0,724],[1281,1748,0,724],[1748,2172,0,724]],
+          points: [[181,357],[858,358],[1119,365],[1525,361],[1955,357]] }
+};
+const anims = { idle: null, walk: null, jump: null, crouch: null, shoot: null, shootwalk: null, jumpshoot: null, bullet: null };   // frame pronti: { canvas, w, h, ax }
+
+// Rimpicciolisce a passi di meta' (risultato piu' pulito di un unico salto)
+function resizeSmooth(src, w, h) {
+  let cur = src;
+  while (cur.width / 2 > w && cur.height / 2 > h) {
+    const n = document.createElement('canvas');
+    n.width = Math.round(cur.width / 2); n.height = Math.round(cur.height / 2);
+    n.getContext('2d').drawImage(cur, 0, 0, n.width, n.height);
+    cur = n;
+  }
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  const oc = out.getContext('2d');
+  oc.imageSmoothingEnabled = true; oc.imageSmoothingQuality = 'high';
+  oc.drawImage(cur, 0, 0, w, h);
+  return out;
+}
+
+function buildFrames(img, sheet) {
+  const full = document.createElement('canvas');
+  full.width = img.width; full.height = img.height;
+  const fc = full.getContext('2d');
+  fc.drawImage(img, 0, 0);
+  const scale = SPRITE_H / sheet.refH;
+  const bgPx = fc.getImageData(2, 2, 1, 1).data;  // verde di sfondo, letto dall'angolo dell'immagine
+  const BG = [bgPx[0], bgPx[1], bgPx[2]];
+  const BG_GREEN = Math.max(60, BG[1] - Math.max(BG[0], BG[2]));
+  return sheet.cells.map(([x0, x1, y0, y1], idx) => {
+    const cw = x1 - x0, ch = y1 - y0;
+    const id = fc.getImageData(x0, y0, cw, ch), d = id.data;
+    // 1) tolgo il verde: trasparenza in base a quanto verde c'e' + recupero del colore vero
+    for (let i = 0; i < d.length; i += 4) {
+      const r = d[i], g = d[i+1], b = d[i+2];
+      let al = 1 - (g - Math.max(r, b)) / BG_GREEN;
+      al = Math.max(0, Math.min(1, al));
+      if (al < 0.25) { d[i+3] = 0; continue; }   // sotto il 25% e' sfondo (anche il verde sfumato ai bordi dell'immagine)
+      d[i]   = Math.max(0, Math.min(255, (r - (1 - al) * BG[0]) / al));
+      d[i+1] = Math.max(0, Math.min(255, (g - (1 - al) * BG[1]) / al));
+      d[i+2] = Math.max(0, Math.min(255, (b - (1 - al) * BG[2]) / al));
+      d[i+3] = Math.round(al * 255);
+    }
+    // 1b) rettangoli da cancellare (opzionale, vedi 'erase' negli sheet): servono dove due frame si sovrappongono in orizzontale
+    if (sheet.erase && sheet.erase[idx]) for (const [ex0, ex1, ey0, ey1] of sheet.erase[idx])
+      for (let y = Math.max(ey0, y0); y < Math.min(ey1, y1); y++)
+        for (let x = Math.max(ex0, x0); x < Math.min(ex1, x1); x++) d[((y - y0) * cw + (x - x0)) * 4 + 3] = 0;
+    // 2) rettangolo occupato dal personaggio + centro della testa (per l'ancoraggio)
+    let minX = cw, maxX = 0, minY = ch, maxY = 0;
+    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++)
+      if (d[(y * cw + x) * 4 + 3] > 60) { if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+    const bw = maxX - minX + 1, bh = maxY - minY + 1;
+    let hMin = cw, hMax = 0;
+    for (let y = minY; y < minY + Math.max(1, Math.floor(bh * (sheet.headFrac || 0.22))); y++) for (let x = 0; x < cw; x++)
+      if (d[(y * cw + x) * 4 + 3] > 60) { if (x < hMin) hMin = x; if (x > hMax) hMax = x; }
+    const ax = (hMin + hMax) / 2 - minX;         // x della testa dentro al ritaglio
+    // 3) ritaglio + riduzione
+    const tmp = document.createElement('canvas');
+    tmp.width = cw; tmp.height = ch;
+    tmp.getContext('2d').putImageData(id, 0, 0);
+    const crop = document.createElement('canvas');
+    crop.width = bw; crop.height = bh;
+    crop.getContext('2d').drawImage(tmp, minX, minY, bw, bh, 0, 0, bw, bh);
+    const w = Math.max(1, Math.round(bw * scale)), h = Math.max(1, Math.round(bh * scale));
+    const out = { canvas: resizeSmooth(crop, w, h), w, h, ax: ax * scale };
+    // punto d'ancoraggio opzionale (sheet.points, coordinate dello sheet) dentro al frame ridotto: usato dai proiettili
+    if (sheet.points && sheet.points[idx]) { out.ox = (sheet.points[idx][0] - x0 - minX) * scale; out.oy = (sheet.points[idx][1] - y0 - minY) * scale; }
+    return out;
+  });
+}
+
+for (const name in SHEETS) {
+  const img = new Image();
+  img.crossOrigin = 'anonymous';   // serve per poter leggere i pixel
+  img.onload = () => {
+    try { anims[name] = buildFrames(img, SHEETS[name]); }
+    catch (e) { console.warn('Sprite ' + name + ' non utilizzabile:', e); }
+  };
+  img.onerror = () => console.warn('Impossibile caricare lo sprite ' + name + ' da GitHub.');
+  img.src = RAW + encodeURIComponent(SHEETS[name].file);
+}
+
+/* ---------------- LOGICA (update a 60 aggiornamenti al secondo) ---------------- */
+function update() {
+  frameCount++;
+  const p = player;
+
+  // Accovacciarsi (Giu) solo a terra; da accovacciati non ci si muove (come in Metal Slug)
+  const wasCrouching = p.crouching;
+  p.crouching = p.onGround && !!keys['ArrowDown'];
+  // timer per l'animazione: da quando sei accovacciato / da quando ti sei rialzato
+  p.crouchTimer = p.crouching ? p.crouchTimer + 1 : 0;
+  if (wasCrouching && !p.crouching && p.onGround) p.standTimer = CROUCH_EXIT_TICKS;
+  else if (p.standTimer > 0) p.standTimer--;
+  p.aimUp = !!keys['ArrowUp'] && !p.crouching;   // PRONTO per la mira verso l'alto
+
+  // Movimento orizzontale
+  let dir = 0;
+  if (keys['ArrowLeft'])  dir -= 1;
+  if (keys['ArrowRight']) dir += 1;
+  if (p.crouching) dir = 0;
+  p.vx = dir * WALK_SPEED;
+  if (dir !== 0) p.facing = dir;
+  // il timer della camminata parte da zero ogni volta che ricominci a camminare
+  if (p.onGround && dir !== 0) p.walkTimer++; else p.walkTimer = 0;
+
+  // Salto con Spazio (solo da terra)
+  if (pressedThisFrame['Space'] && p.onGround && !p.crouching) {
+    p.vy = JUMP_VELOCITY;
+    p.onGround = false;
+  }
+
+  // Fisica: gravita' + collisione col terreno
+  const wasOnGround = p.onGround;
+  p.x += p.vx;
+  p.x = Math.max(0, Math.min(LEVEL_WIDTH - p.w, p.x));
+  p.vy += GRAVITY;
+  p.y += p.vy;
+  if (p.y >= GROUND_Y) { p.y = GROUND_Y; p.vy = 0; p.onGround = true; }
+  else p.onGround = false;
+  // timer per scegliere il frame del salto
+  if (!p.onGround) p.airTimer = wasOnGround ? 0 : p.airTimer + 1;
+  if (!wasOnGround && p.onGround) p.landTimer = LAND_TICKS;     // appena atterrato
+  else if (p.landTimer > 0) p.landTimer--;
+
+  // Sparo con C (tenendo premuto spara a raffica)
+  p.fireTimer = Math.max(0, p.fireTimer - 1);
+  if (p.shootAge < SHOOT_END_TICKS) p.shootAge++;               // avanza l'animazione di sparo
+  if (keys['KeyC'] && p.fireTimer === 0) {
+    shoot(); p.fireTimer = FIRE_COOLDOWN;
+    // animazione di sparo a terra (fermo o camminando) o in salto (no accovacciato, no mira in alto)
+    if (!p.crouching && !p.aimUp)
+      p.shootAge = p.shootAge >= SHOOT_END_TICKS ? -SHOOT_WINDUP_TICKS : 0;
+  }
+
+  // Bomba con X (una per pressione)
+  p.bombTimer = Math.max(0, p.bombTimer - 1);
+  if (pressedThisFrame['KeyX'] && p.bombTimer === 0 && bombs.length < 10) { throwBomb(); p.bombTimer = BOMB_COOLDOWN; }
+
+  updateProjectiles();
+
+  // Camera: segue il player, non torna mai indietro (come Metal Slug)
+  const target = p.x - W * 0.4;
+  if (target > cameraX) cameraX = target;
+  cameraX = Math.max(0, Math.min(LEVEL_WIDTH - W, cameraX));
+  if (p.x < cameraX) p.x = cameraX;     // muro invisibile a sinistra
+
+  for (const k in pressedThisFrame) delete pressedThisFrame[k];
+}
+
+function currentHeight() { return player.crouching ? 52 : player.h; }
+
+function shoot() {
+  const p = player;
+  const h = currentHeight();
+  let b;
+  if (p.aimUp) {  // verso l'alto
+    b = { x: p.x + p.w/2, y: p.y - h, vx: 0, vy: -BULLET_SPEED };
+  } else {        // orizzontale (dall'altezza della "pistola")
+    b = { x: p.x + p.w/2 + p.facing * 16, y: p.y - h * 0.6, vx: p.facing * BULLET_SPEED, vy: 0 };
+    if (!p.crouching) {   // fermo, camminando o in salto: il getto esce dall'ugello che si vede nello sprite, con il lampo di partenza
+      const m = !p.onGround ? MUZZLE_AIR : p.vx !== 0 ? MUZZLE_WALK : MUZZLE_STAND;
+      b.x = p.x + p.w/2 + p.facing * m[0]; b.y = p.y - m[1];
+      muzzles.push({ dx: m[0], dy: m[1], facing: p.facing, t: 0 });
+    }
+  }
+  b.x0 = b.x; b.y0 = b.y;   // punto di partenza: serve a far "crescere" il getto mentre esce
+  bullets.push(b);
+}
+
+function throwBomb() {
+  const p = player;
+  bombs.push({ x: p.x + p.w/2, y: p.y - currentHeight() * 0.7, vx: p.facing * 4.4 + p.vx * 0.5, vy: -7 });
+  console.log('BOMBA lanciata!');
+}
+
+function updateProjectiles() {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.x += b.vx; b.y += b.vy;
+    const hit = bulletHit(b);                      // null oppure il punto d'impatto { x, y }
+    if (hit) { impacts.push({ x: hit.x, y: hit.y, vx: b.vx, vy: b.vy, t: 0 }); bullets.splice(i, 1); }
+    else if (b.x < cameraX - 40 || b.x > cameraX + W + 40 || b.y < -40) bullets.splice(i, 1);
+  }
+  for (let i = muzzles.length - 1; i >= 0; i--) if (++muzzles[i].t >= BULLET_LAUNCH_TICKS) muzzles.splice(i, 1);
+  for (let i = impacts.length - 1; i >= 0; i--) if (++impacts[i].t >= 3 * BULLET_IMPACT_FRAME_TICKS) impacts.splice(i, 1);
+  for (let i = bombs.length - 1; i >= 0; i--) {
+    const b = bombs[i];
+    b.vy += BOMB_GRAVITY; b.x += b.vx; b.y += b.vy;
+    if (b.y >= GROUND_Y) {   // tocca terra -> esplode
+      explosions.push({ x: b.x, y: GROUND_Y, t: 0 });
+      console.log('BOOM! esplosione a x=' + Math.round(b.x));
+      bombs.splice(i, 1);
+    }
+  }
+  for (let i = explosions.length - 1; i >= 0; i--) {
+    if (++explosions[i].t > 24) explosions.splice(i, 1);
+  }
+}
+
+// Frame dello sparo in aria (sheet JUMPSHOOT), oppure null se non stai sparando: in quel caso il salto resta quello di prima.
+function jumpShootFrame() {
+  const p = player, a = p.shootAge, S = anims.jumpshoot;
+  if (!S || p.aimUp || a >= SHOOT_END_TICKS) return null;
+  if (a >= 0 && a < SHOOT_FIRE_TICKS) return S[2];                       // spruzzo a mezz'aria
+  if (p.airTimer < JUMP_TAKEOFF_TICKS) return S[0];                      // stacco (salti mentre spari)
+  if (a < SHOOT_FIRE_TICKS + SHOOT_OPEN_TICKS) return S[1];              // giacca aperta
+  return null;                                                           // sequenza finita: si torna al salto normale
+}
+
+// Il proiettile ha colpito qualcosa? Ritorna il punto d'impatto { x, y } oppure null.
+// Per ora si colpiscono i bersagli segnaposto e il terreno: quando ci saranno nemici e muri basta aggiungerli qui.
+function bulletHit(b) {
+  for (const t of targets)
+    if (b.x >= t.x && b.x <= t.x + t.w && b.y >= t.y && b.y <= t.y + t.h)
+      return { x: b.vx > 0 ? t.x : b.vx < 0 ? t.x + t.w : b.x,        // impatto sulla faccia colpita
+               y: b.vx === 0 && b.vy < 0 ? t.y + t.h : b.y };
+  if (b.y >= GROUND_Y) return { x: b.x, y: GROUND_Y };
+  return null;
+}
+
+// Disegna i frame del proiettile: lampo di partenza, getto in volo, splash d'impatto.
+// Lo sheet guarda a DESTRA: si specchia verso sinistra e si ruota di 90 gradi per i colpi verso l'alto.
+function drawBulletSprites() {
+  const F = anims.bullet;
+  // 1) partenza: lampo con l'ugello, resta attaccato al personaggio per BULLET_LAUNCH_TICKS
+  for (const m of muzzles) {
+    const f = F[0];
+    ctx.save();
+    ctx.translate(Math.round(player.x + player.w / 2 + m.facing * m.dx), Math.round(player.y - m.dy));
+    if (m.facing < 0) ctx.scale(-1, 1);
+    ctx.drawImage(f.canvas, -Math.round(f.ox), -Math.round(f.oy));
+    ctx.restore();
+  }
+  // 2) in volo: la punta del getto e' sul proiettile, la coda e' dietro. Appena uscito si vede solo la parte
+  //    davanti, poi il getto si allunga man mano che avanza (cosi' non attraversa il personaggio).
+  const fl = F[1];
+  for (const b of bullets) {
+    const dist = Math.abs(b.x - b.x0) + Math.abs(b.y - b.y0);
+    const vis = Math.min(fl.ox, Math.round(dist) + BULLET_TRAIL_START);          // lunghezza visibile (px) dietro alla punta
+    ctx.save();
+    ctx.translate(Math.round(b.x), Math.round(b.y));
+    if (b.vy < 0) ctx.rotate(-Math.PI / 2); else if (b.vx < 0) ctx.scale(-1, 1);
+    ctx.drawImage(fl.canvas, fl.ox - vis, 0, vis, fl.h, -vis, -Math.round(fl.oy), vis, fl.h);
+    ctx.restore();
+  }
+  // 3) impatto: 3 frame (splash che si apre, splash grande, goccioline) centrati sul punto colpito
+  for (const im of impacts) {
+    const f = F[2 + Math.min(2, Math.floor(im.t / BULLET_IMPACT_FRAME_TICKS))];
+    ctx.save();
+    ctx.translate(Math.round(im.x), Math.round(im.y));
+    if (im.vx === 0 && im.vy < 0) ctx.rotate(-Math.PI / 2); else if (im.vx < 0) ctx.scale(-1, 1);
+    ctx.drawImage(f.canvas, -Math.round(f.ox), -Math.round(f.oy));
+    ctx.restore();
+  }
+}
+
+// Bersagli segnaposto (casse con una X): servono solo per provare l'impatto
+function drawTargets() {
+  for (const t of targets) {
+    ctx.fillStyle = '#8a5a2b'; ctx.fillRect(t.x, t.y, t.w, t.h);
+    ctx.strokeStyle = '#4b2e12'; ctx.lineWidth = 2; ctx.strokeRect(t.x + 1, t.y + 1, t.w - 2, t.h - 2);
+    ctx.beginPath(); ctx.moveTo(t.x + 2, t.y + 2); ctx.lineTo(t.x + t.w - 2, t.y + t.h - 2);
+    ctx.moveTo(t.x + t.w - 2, t.y + 2); ctx.lineTo(t.x + 2, t.y + t.h - 2); ctx.stroke();
+  }
+}
+
+/* ---------------- DISEGNO ---------------- */
+function draw() {
+  // Cielo
+  ctx.fillStyle = '#5ab0e8'; ctx.fillRect(0, 0, W, H);
+
+  // Sfondo lontano (parallasse) - segnaposto, poi lo sostituiremo con un'immagine
+  ctx.fillStyle = '#3c7a5a';
+  for (let i = -1; i < 12; i++) {
+    const bx = i * 160 - Math.floor(cameraX * 0.3) % 160;
+    ctx.fillRect(bx, GROUND_Y - 80 - (i % 3) * 24, 120, 80 + (i % 3) * 24);
+  }
+
+  ctx.save();
+  ctx.translate(-Math.round(cameraX), 0);
+  const cx = Math.round(cameraX);
+
+  // Terreno solido
+  ctx.fillStyle = '#7a5a34'; ctx.fillRect(cx, GROUND_Y, W, H - GROUND_Y);
+  ctx.fillStyle = '#4e8a2c'; ctx.fillRect(cx, GROUND_Y, W, 8);
+  // Tacche sul terreno: servono a vedere lo scorrimento
+  ctx.fillStyle = '#5e4425';
+  for (let x = Math.floor(cx / 64) * 64; x < cx + W + 64; x += 64) ctx.fillRect(x, GROUND_Y + 24, 32, 6);
+
+  drawTargets();   // bersagli segnaposto (dietro al personaggio)
+
+  /* PLAYER: in aria -> JUMP, Giu -> CROUCH, cammina a terra -> WALK, altrimenti -> IDLE.
+     La mira in alto usa ancora l'idle: quando avremo lo sprite si aggiunge qui sotto (aimUp).
+     Se gli sprite non sono caricati si vede il rettangolo di emergenza. */
+  const p = player, h = currentHeight();
+  let frame = null;
+  if (!p.onGround && anims.jump) {                  // IN ARIA: carica -> salita -> apice -> discesa
+    const J = anims.jump;
+    const SJ = jumpShootFrame();                    // se stai sparando (o hai appena sparato) usa JUMPSHOOT, altrimenti il salto normale
+    if (SJ) frame = SJ;
+    else if (p.airTimer < JUMP_TAKEOFF_TICKS) frame = J[0];
+    else if (p.vy < -JUMP_APEX_VY) frame = J[1];
+    else if (p.vy <= JUMP_APEX_VY) frame = J[2];
+    else frame = J[3];
+  }
+  else if (p.crouching && anims.crouch) {            // ACCOVACCIATO: transizione, poi posa fissa
+    const C = anims.crouch;
+    if (p.crouchTimer <= CROUCH_ENTER_TICKS) frame = C[0];
+    else frame = C[1 + (Math.floor(p.crouchTimer / CROUCH_HOLD_TICKS) % 2)];
+  }
+  else if (p.onGround && p.landTimer > 0 && !p.crouching && !p.aimUp && p.vx === 0 && p.shootAge < SHOOT_END_TICKS
+           && (p.shootAge < 0 || p.shootAge >= SHOOT_FIRE_TICKS) && anims.jumpshoot)
+    frame = anims.jumpshoot[3];                     // atterraggio mentre si sta sparando (se non sei nel momento dello spruzzo)
+  else if (p.onGround && !p.crouching && !p.aimUp && p.shootAge < SHOOT_END_TICKS && (p.vx === 0 ? anims.shoot : anims.shootwalk)) {   // SPARO (fermo -> SHOOT, camminando -> SHOOTWALK)
+    const S = p.vx === 0 ? anims.shoot : anims.shootwalk, a = p.shootAge;
+    if (a < 0) frame = S[1];                                          // giacca aperta (solo primo colpo)
+    else if (a < SHOOT_FIRE_TICKS) frame = S[2];                      // spruzzo + vampata
+    else if (a < SHOOT_FIRE_TICKS + SHOOT_OPEN_TICKS) frame = S[1];   // giacca ancora aperta
+    else frame = S[3];                                                // posa finale (giacca chiusa)
+  }
+  else if (p.onGround && p.standTimer > 0 && p.vx === 0 && anims.crouch)
+    frame = anims.crouch[0];                        // ti rialzi (stessa posa di transizione)
+  else if (p.onGround && p.landTimer > 0 && !p.crouching && p.vx === 0 && anims.jump)
+    frame = anims.jump[4];                          // atterraggio (solo se resti fermo)
+  else if (p.onGround && !p.crouching && p.vx !== 0 && anims.walk)
+    frame = anims.walk[Math.floor(p.walkTimer / WALK_FRAME_TICKS) % anims.walk.length];
+  else if (anims.idle)
+    frame = anims.idle[Math.floor(frameCount / IDLE_FRAME_TICKS) % anims.idle.length];
+  if (frame) {
+    const flip = (p.facing === 1) !== SPRITE_FACES_RIGHT;      // specchio se guarda dal lato opposto
+    const ax = flip ? frame.w - frame.ax : frame.ax;
+    const dx = Math.round(p.x + p.w / 2 - ax);                 // testa centrata sulla hitbox
+    const dy = Math.round(p.y - frame.h);                      // piedi appoggiati al terreno
+    if (flip) {
+      ctx.save(); ctx.translate(dx + frame.w, dy); ctx.scale(-1, 1);
+      ctx.drawImage(frame.canvas, 0, 0); ctx.restore();
+    } else {
+      ctx.drawImage(frame.canvas, dx, dy);
+    }
+  } else {
+    ctx.fillStyle = p.crouching ? '#e6a23c' : '#e04040';
+    ctx.fillRect(Math.round(p.x), Math.round(p.y - h), p.w, h);
+  }
+
+  /* PROIETTILI: partenza, volo e impatto da BULLET_01.png. Se lo sprite non e' caricato restano i rettangolini gialli. */
+  if (anims.bullet) drawBulletSprites();
+  else {
+    ctx.fillStyle = '#ffe14d';
+    for (const b of bullets) ctx.fillRect(Math.round(b.x - 4), Math.round(b.y - 2), b.vx ? 10 : 4, b.vx ? 4 : 10);
+  }
+
+  /* >>> QUI: sprite delle bombe (per ora quadratini verdi) <<< */
+  ctx.fillStyle = '#3fb34f';
+  for (const b of bombs) ctx.fillRect(Math.round(b.x - 6), Math.round(b.y - 6), 12, 12);
+
+  /* >>> QUI: sprite animato dell'esplosione (per ora cerchi) <<< */
+  for (const e of explosions) {
+    const r = 12 + e.t * 2.8;
+    ctx.fillStyle = e.t < 12 ? '#ff9a1f' : '#ff4a1f';
+    ctx.globalAlpha = 1 - e.t / 28;
+    ctx.beginPath(); ctx.arc(e.x, e.y - r * 0.5, r, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+
+  drawDebug();
+}
+
+// Scritte di debug: mostrano i tasti premuti in tempo reale
+function drawDebug() {
+  const names = [['ArrowLeft','SX'],['ArrowRight','DX'],['ArrowUp','SU'],['ArrowDown','GIU'],['Space','SALTO'],['KeyC','SPARA'],['KeyX','BOMBA']];
+  ctx.font = '14px monospace'; ctx.textBaseline = 'top';
+  let x = 8;
+  for (const [code, label] of names) {
+    const on = keys[code], w = ctx.measureText(label).width + 14;
+    ctx.fillStyle = on ? '#ffe14d' : 'rgba(0,0,0,0.55)'; ctx.fillRect(x, 8, w, 22);
+    ctx.fillStyle = on ? '#000' : '#aaa'; ctx.fillText(label, x + 7, 12);
+    x += w + 6;
+  }
+  ctx.fillStyle = '#fff';
+  const p = player;
+  ctx.fillText('x:' + Math.round(p.x) + ' y:' + Math.round(p.y) + ' ' + (p.onGround ? 'A TERRA' : 'IN ARIA') +
+    (p.crouching ? ' | ACCOVACCIATO' : '') + (p.aimUp ? ' | MIRA SU' : ''), 8, 38);
+  ctx.fillText('proiettili:' + bullets.length + ' bombe:' + bombs.length, 8, 58);
+}
+
+/* ---------------- GAME LOOP a 60fps (passo fisso) ----------------
+   Accumuliamo il tempo reale e facciamo update() a passi esatti di 1/60 s,
+   cosi' il gioco va alla stessa velocita' anche su monitor a 120/144Hz. */
+const STEP = 1000 / 60;
+let last = performance.now(), acc = 0;
+function loop(now) {
+  acc += Math.min(now - last, 250);   // limite per evitare salti dopo cambio scheda
+  last = now;
+  while (acc >= STEP) { update(); acc -= STEP; }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
